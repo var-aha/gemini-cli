@@ -76,7 +76,11 @@ import { useTextBuffer } from './components/shared/text-buffer.js';
 import { useLogger } from './hooks/useLogger.js';
 import { useGeminiStream } from './hooks/useGeminiStream.js';
 import { useVim } from './hooks/vim.js';
-import { type LoadedSettings, SettingScope } from '../config/settings.js';
+import {
+  type LoadableSettingScope,
+  type LoadedSettings,
+  SettingScope,
+} from '../config/settings.js';
 import { type InitializationResult } from '../core/initializer.js';
 import { useFocus } from './hooks/useFocus.js';
 import { useBracketedPaste } from './hooks/useBracketedPaste.js';
@@ -100,6 +104,7 @@ import {
   useExtensionUpdates,
 } from './hooks/useExtensionUpdates.js';
 import { ShellFocusContext } from './contexts/ShellFocusContext.js';
+import { useShellHistory } from './hooks/useShellHistory.js';
 import { type ExtensionManager } from '../config/extension-manager.js';
 import { requestConsentInteractive } from '../config/extensions/consent.js';
 import { disableMouseEvents, enableMouseEvents } from './utils/mouse.js';
@@ -153,6 +158,7 @@ export const AppContainer = (props: AppContainerProps) => {
   );
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const [embeddedShellFocused, setEmbeddedShellFocused] = useState(false);
+  const quickCommandAbortControllerRef = useRef<AbortController | null>(null);
   const [showDebugProfiler, setShowDebugProfiler] = useState(false);
   const [copyModeEnabled, setCopyModeEnabled] = useState(false);
 
@@ -323,6 +329,8 @@ export const AppContainer = (props: AppContainerProps) => {
     shellModeActive,
   });
 
+  const shellHistory = useShellHistory(config.getProjectRoot());
+
   useEffect(() => {
     const fetchUserMessages = async () => {
       const pastMessagesRaw = (await logger?.getPreviousUserMessages()) || [];
@@ -396,7 +404,7 @@ export const AppContainer = (props: AppContainerProps) => {
 
   // Create handleAuthSelect wrapper for backward compatibility
   const handleAuthSelect = useCallback(
-    async (authType: AuthType | undefined, scope: SettingScope) => {
+    async (authType: AuthType | undefined, scope: LoadableSettingScope) => {
       if (authType) {
         await clearCachedCredentialFile();
         settings.setValue(scope, 'security.auth.selectedType', authType);
@@ -655,6 +663,7 @@ Logging in with Google... Please restart Gemini CLI to continue.
     handleApprovalModeChange,
     activePtyId,
     loopDetectionConfirmationRequest,
+    handleShellCommand,
   } = useGeminiStream(
     config.getGeminiClient(),
     historyManager.history,
@@ -805,11 +814,27 @@ Logging in with Google... Please restart Gemini CLI to continue.
 
   useEffect(() => {
     if (activePtyId) {
-      ShellExecutionService.resizePty(
-        activePtyId,
-        Math.floor(terminalWidth * SHELL_WIDTH_FRACTION),
-        Math.max(Math.floor(availableTerminalHeight - SHELL_HEIGHT_PADDING), 1),
-      );
+      try {
+        ShellExecutionService.resizePty(
+          activePtyId,
+          Math.floor(terminalWidth * SHELL_WIDTH_FRACTION),
+          Math.max(
+            Math.floor(availableTerminalHeight - SHELL_HEIGHT_PADDING),
+            1,
+          ),
+        );
+      } catch (e) {
+        // This can happen in a race condition where the pty exits
+        // right before we try to resize it.
+        if (
+          !(
+            e instanceof Error &&
+            e.message.includes('Cannot resize a pty that has already exited')
+          )
+        ) {
+          throw e;
+        }
+      }
     }
   }, [terminalWidth, availableTerminalHeight, activePtyId]);
 
@@ -1035,6 +1060,9 @@ Logging in with Google... Please restart Gemini CLI to continue.
         // If the user presses Ctrl+C, we want to cancel any ongoing requests.
         // This should happen regardless of the count.
         cancelOngoingRequest?.();
+        // Also cancel quick command if one is running
+        quickCommandAbortControllerRef.current?.abort();
+        quickCommandAbortControllerRef.current = null;
 
         setCtrlCPressCount((prev) => prev + 1);
         return;
@@ -1074,6 +1102,31 @@ Logging in with Google... Please restart Gemini CLI to continue.
         !enteringConstrainHeightMode
       ) {
         setConstrainHeight(false);
+      } else if (keyMatchers[Command.EXECUTE_PROMPT_COMMAND](key)) {
+        const commandToExecute = buffer.text.trim();
+        if (commandToExecute) {
+          buffer.setText('');
+          // Add command to shell history
+          shellHistory.addCommandToHistory(commandToExecute);
+          const abortController = new AbortController();
+          // Store the controller so Ctrl+C can cancel it
+          quickCommandAbortControllerRef.current = abortController;
+
+          // Clear the ref when the command completes or is aborted
+          const cleanup = () => {
+            if (quickCommandAbortControllerRef.current === abortController) {
+              quickCommandAbortControllerRef.current = null;
+            }
+          };
+          abortController.signal.addEventListener('abort', cleanup, {
+            once: true,
+          });
+
+          // Using the same shell command processor as Shell Mode
+          handleShellCommand(commandToExecute, abortController.signal);
+        }
+        // Consume the key event even if buffer is empty to prevent newline
+        return;
       } else if (keyMatchers[Command.TOGGLE_SHELL_INPUT_FOCUS](key)) {
         if (activePtyId || embeddedShellFocused) {
           setEmbeddedShellFocused((prev) => !prev);
@@ -1087,13 +1140,15 @@ Logging in with Google... Please restart Gemini CLI to continue.
       config,
       ideContextState,
       setCtrlCPressCount,
-      buffer.text.length,
+      buffer,
       setCtrlDPressCount,
       handleSlashCommand,
       cancelOngoingRequest,
       activePtyId,
       embeddedShellFocused,
       settings.merged.general?.debugKeystrokeLogging,
+      handleShellCommand,
+      shellHistory,
       refreshStatic,
       setCopyModeEnabled,
       copyModeEnabled,
